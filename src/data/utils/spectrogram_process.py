@@ -20,7 +20,10 @@ class SpectrogramGraphBuilder:
         regions: List[str] = None,
         bands: Dict[str, List[float]] = None,
         aggregation: str = 'mean',
-        spatial_edges: List[List[int]] = None
+        spatial_edges: List[List[int]] = None,
+        apply_preprocessing: bool = True,
+        clip_min: float = 1e-7,
+        clip_max: float = 1e-4
     ):
         """
         Args:
@@ -30,6 +33,9 @@ class SpectrogramGraphBuilder:
             bands: Dictionary of frequency bands {name: [low, high]}
             aggregation: Method to aggregate frequency bins ('mean' or 'max')
             spatial_edges: List of edge pairs for spatial connectivity
+            apply_preprocessing: Whether to apply clip + log + normalize
+            clip_min: Minimum value for clipping (default: 1e-7)
+            clip_max: Maximum value for clipping (default: 1e-4)
         """
         self.window_size = window_size
         self.stride = stride
@@ -48,10 +54,59 @@ class SpectrogramGraphBuilder:
             [0, 1], [1, 0],  # LL <-> RL
             [2, 3], [3, 2],  # LP <-> RP
         ]
+        self.apply_preprocessing = apply_preprocessing
+        self.clip_min = clip_min
+        self.clip_max = clip_max
         
         # Compute expected number of windows
         self.n_windows = int((600 - window_size) / stride) + 1  # Should be 119
         assert self.n_windows == 119
+    
+    def preprocess_spectrogram(self, spec_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply preprocessing to raw spectrogram values:
+        1. Clip values between clip_min and clip_max
+        2. Take logarithm
+        3. Normalize to mean=0, std=1
+        
+        Args:
+            spec_df: DataFrame with spectrogram values
+        
+        Returns:
+            Preprocessed DataFrame with same structure
+        """
+        if not self.apply_preprocessing:
+            return spec_df
+        
+        # Create a copy to avoid modifying original
+        processed_df = spec_df.copy()
+        
+        # Get all numeric columns (exclude 'time' column)
+        numeric_cols = [col for col in processed_df.columns if col != 'time']
+        
+        if len(numeric_cols) == 0:
+            return processed_df
+        
+        # 1. Clip values
+        processed_df[numeric_cols] = processed_df[numeric_cols].clip(
+            lower=self.clip_min,
+            upper=self.clip_max
+        )
+        
+        # 2. Take logarithm
+        processed_df[numeric_cols] = np.log(processed_df[numeric_cols])
+        
+        # 3. Normalize to mean=0, std=1 (across all values in the spectrogram)
+        all_values = processed_df[numeric_cols].values.flatten()
+        mean = np.mean(all_values)
+        std = np.std(all_values)
+        
+        if std > 1e-10:  # Avoid division by zero
+            processed_df[numeric_cols] = (processed_df[numeric_cols] - mean) / std
+        else:
+            processed_df[numeric_cols] = processed_df[numeric_cols] - mean
+        
+        return processed_df
     
     def extract_temporal_windows(self, spec_df: pd.DataFrame) -> List[pd.DataFrame]:
         """
@@ -186,8 +241,11 @@ class SpectrogramGraphBuilder:
         Returns:
             List of PyG Data objects (length = n_windows, expected 119)
         """
+        # Apply preprocessing (clip, log, normalize)
+        preprocessed_df = self.preprocess_spectrogram(spec_df)
+        
         # Extract temporal windows
-        windows = self.extract_temporal_windows(spec_df)
+        windows = self.extract_temporal_windows(preprocessed_df)
         
         # Validate we got the expected number of windows
         if len(windows) != self.n_windows:

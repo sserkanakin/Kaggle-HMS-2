@@ -70,6 +70,14 @@ spectrogram:
   duration: 600 # seconds (10 minutes)
   temporal_resolution: 2 # Hz (one sample every ~2 seconds)
 
+  # Spectrogram preprocessing (applied before feature extraction)
+  preprocessing:
+    enabled: true
+    clip_min: 1.0e-7 # Minimum value for clipping
+    clip_max: 1.0e-4 # Maximum value for clipping
+    apply_log: true # Take logarithm after clipping
+    normalize: true # Normalize to mean=0, std=1
+
   # Temporal windowing
   window_size: 10 # seconds
   stride: 5 # seconds - 50% overlap

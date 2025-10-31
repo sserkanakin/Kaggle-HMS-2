@@ -230,7 +230,10 @@ def process_single_label_wrapper(args):
         regions=config_dict['spectrogram']['regions'],
         bands=config_dict['spectrogram']['bands'],
         aggregation=config_dict['spectrogram']['aggregation'],
-        spatial_edges=config_dict['spectrogram']['spatial_edges']
+        spatial_edges=config_dict['spectrogram']['spatial_edges'],
+        apply_preprocessing=config_dict['spectrogram']['preprocessing']['enabled'],
+        clip_min=config_dict['spectrogram']['preprocessing']['clip_min'],
+        clip_max=config_dict['spectrogram']['preprocessing']['clip_max']
     )
     
     return process_single_label(
@@ -315,11 +318,17 @@ def process_all_data(config, n_workers=None):
         regions=list(config.spectrogram.regions),
         bands=dict(config.spectrogram.bands),
         aggregation=config.spectrogram.aggregation,
-        spatial_edges=config.spectrogram.spatial_edges
+        spatial_edges=config.spectrogram.spatial_edges,
+        apply_preprocessing=config.spectrogram.preprocessing.enabled,
+        clip_min=config.spectrogram.preprocessing.clip_min,
+        clip_max=config.spectrogram.preprocessing.clip_max
     )
     
     print(f"  ✓ EEG: {eeg_builder.n_windows} windows per sample")
     print(f"  ✓ Spectrogram: {spec_builder.n_windows} windows per sample")
+    
+    if spec_builder.apply_preprocessing:
+        print(f"  ✓ Spectrogram preprocessing: clip [{spec_builder.clip_min:.0e}, {spec_builder.clip_max:.0e}] → log → normalize")
     
     # === Load metadata ===
     print("\n[2/5] Loading metadata...")
