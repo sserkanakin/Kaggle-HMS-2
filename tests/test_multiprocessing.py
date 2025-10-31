@@ -9,7 +9,7 @@ import sys
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-from src.data.make_dataset import load_config, process_all_data
+from src.data.make_graph_dataset import load_config, process_all_data
 
 if __name__ == "__main__":
     print("Testing multiprocessing setup...")

@@ -11,7 +11,7 @@ import pytest
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.data.make_dataset import get_processed_patients
+from src.data.make_graph_dataset import get_processed_patients
 
 
 @pytest.fixture
