@@ -73,7 +73,7 @@ def test_processed_data_exists(processed_dir):
     # Check metadata
     metadata_path = processed_dir / "metadata.pt"
     if metadata_path.exists():
-        metadata = torch.load(metadata_path)
+        metadata = torch.load(metadata_path, weights_only=False)
         
         assert 'n_patients' in metadata
         assert 'n_samples' in metadata
@@ -97,7 +97,7 @@ def test_patient_file_structure(processed_dir):
     patient_id = list(existing_patients)[0]
     patient_file = processed_dir / f"patient_{patient_id}.pt"
     
-    patient_data = torch.load(patient_file)
+    patient_data = torch.load(patient_file, weights_only=False)
     
     # Check it's a dictionary
     assert isinstance(patient_data, dict), "Patient data should be a dictionary"
@@ -135,7 +135,7 @@ def test_metadata_consistency(processed_dir):
     if not metadata_path.exists():
         pytest.skip("No metadata file available")
     
-    metadata = torch.load(metadata_path)
+    metadata = torch.load(metadata_path, weights_only=False)
     existing_patients = get_processed_patients(processed_dir)
     
     # Check counts match

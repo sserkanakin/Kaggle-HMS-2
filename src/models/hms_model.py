@@ -1,0 +1,174 @@
+"""Multi-modal temporal graph neural network for HMS brain activity classification."""
+
+from __future__ import annotations
+
+from typing import List, Optional
+
+import torch
+from torch import nn
+from torch_geometric.data import Batch
+
+from src.models.temporal_encoder import TemporalGraphEncoder
+from src.models.fusion import CrossModalFusion
+from src.models.classifier import MLPClassifier
+
+
+class HMSMultiModalGNN(nn.Module):
+    """Multi-modal GNN for EEG and Spectrogram classification.
+    
+    Architecture:
+    1. EEG Branch: 9 graphs → GAT → BiLSTM → features
+    2. Spectrogram Branch: 119 graphs → GAT → BiLSTM → features  
+    3. Cross-Modal Fusion: Bidirectional attention between modalities
+    4. Classifier: MLP → 6 class predictions
+    
+    This model processes temporal sequences of graphs from two modalities,
+    learns temporal dependencies, fuses them with cross-attention, and
+    predicts one of 6 brain activity classes.
+    
+    Parameters
+    ----------
+    eeg_config : dict
+        Configuration for EEG encoder
+    spec_config : dict
+        Configuration for spectrogram encoder
+    fusion_config : dict
+        Configuration for fusion module
+    classifier_config : dict
+        Configuration for classifier
+    num_classes : int
+        Number of output classes (default: 6)
+    """
+    
+    def __init__(
+        self,
+        eeg_config: Optional[dict] = None,
+        spec_config: Optional[dict] = None,
+        fusion_config: Optional[dict] = None,
+        classifier_config: Optional[dict] = None,
+        num_classes: int = 6,
+    ) -> None:
+        super().__init__()
+        
+        # Default configurations
+        eeg_config = eeg_config or {}
+        spec_config = spec_config or {}
+        fusion_config = fusion_config or {}
+        classifier_config = classifier_config or {}
+        
+        # EEG Encoder (processes 9 temporal graphs)
+        self.eeg_encoder = TemporalGraphEncoder(
+            in_channels=eeg_config.get("in_channels", 5),
+            gat_hidden_dim=eeg_config.get("gat_hidden_dim", 64),
+            gat_out_dim=eeg_config.get("gat_out_dim", 64),
+            gat_num_layers=eeg_config.get("gat_num_layers", 2),
+            gat_heads=eeg_config.get("gat_heads", 4),
+            gat_dropout=eeg_config.get("gat_dropout", 0.3),
+            use_edge_attr=eeg_config.get("use_edge_attr", True),
+            rnn_hidden_dim=eeg_config.get("rnn_hidden_dim", 128),
+            rnn_num_layers=eeg_config.get("rnn_num_layers", 2),
+            rnn_dropout=eeg_config.get("rnn_dropout", 0.2),
+            bidirectional=eeg_config.get("bidirectional", True),
+            pooling_method=eeg_config.get("pooling_method", "mean"),
+        )
+        
+        # Spectrogram Encoder (processes 119 temporal graphs)
+        self.spec_encoder = TemporalGraphEncoder(
+            in_channels=spec_config.get("in_channels", 5),
+            gat_hidden_dim=spec_config.get("gat_hidden_dim", 64),
+            gat_out_dim=spec_config.get("gat_out_dim", 64),
+            gat_num_layers=spec_config.get("gat_num_layers", 2),
+            gat_heads=spec_config.get("gat_heads", 4),
+            gat_dropout=spec_config.get("gat_dropout", 0.3),
+            use_edge_attr=spec_config.get("use_edge_attr", False),  # Spec has fixed edges
+            rnn_hidden_dim=spec_config.get("rnn_hidden_dim", 128),
+            rnn_num_layers=spec_config.get("rnn_num_layers", 2),
+            rnn_dropout=spec_config.get("rnn_dropout", 0.2),
+            bidirectional=spec_config.get("bidirectional", True),
+            pooling_method=spec_config.get("pooling_method", "mean"),
+        )
+        
+        # Cross-Modal Fusion
+        eeg_output_dim = self.eeg_encoder.output_dim
+        spec_output_dim = self.spec_encoder.output_dim
+        
+        self.fusion = CrossModalFusion(
+            eeg_dim=eeg_output_dim,
+            spec_dim=spec_output_dim,
+            hidden_dim=fusion_config.get("hidden_dim", 256),
+            num_heads=fusion_config.get("num_heads", 8),
+            dropout=fusion_config.get("dropout", 0.2),
+        )
+        
+        # Classifier
+        fusion_output_dim = self.fusion.output_dim
+        
+        self.classifier = MLPClassifier(
+            input_dim=fusion_output_dim,
+            hidden_dims=classifier_config.get("hidden_dims", [256, 128]),
+            num_classes=num_classes,
+            dropout=classifier_config.get("dropout", 0.3),
+            activation=classifier_config.get("activation", "elu"),
+        )
+        
+        self.num_classes = num_classes
+    
+    def forward(
+        self,
+        eeg_graphs: List[Batch],
+        spec_graphs: List[Batch],
+    ) -> torch.Tensor:
+        """Forward pass through the multi-modal model.
+        
+        Parameters
+        ----------
+        eeg_graphs : List[Batch]
+            List of 9 batched EEG graphs (one per temporal window)
+        spec_graphs : List[Batch]
+            List of 119 batched spectrogram graphs (one per temporal window)
+        
+        Returns
+        -------
+        torch.Tensor
+            Logits of shape (batch_size, num_classes)
+        """
+        # Encode EEG sequence
+        eeg_features = self.eeg_encoder(eeg_graphs, return_sequence=False)
+        # eeg_features: (batch_size, eeg_output_dim)
+        
+        # Encode Spectrogram sequence
+        spec_features = self.spec_encoder(spec_graphs, return_sequence=False)
+        # spec_features: (batch_size, spec_output_dim)
+        
+        # Fuse modalities with cross-attention
+        fused_features = self.fusion(eeg_features, spec_features)
+        # fused_features: (batch_size, fusion_output_dim)
+        
+        # Classify
+        logits = self.classifier(fused_features)
+        # logits: (batch_size, num_classes)
+        
+        return logits
+    
+    def get_model_info(self) -> dict:
+        """Get model architecture information.
+        
+        Returns
+        -------
+        dict
+            Dictionary containing model dimensions and parameter counts
+        """
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        return {
+            "eeg_output_dim": self.eeg_encoder.output_dim,
+            "spec_output_dim": self.spec_encoder.output_dim,
+            "fusion_output_dim": self.fusion.output_dim,
+            "num_classes": self.num_classes,
+            "total_params": total_params,
+            "trainable_params": trainable_params,
+        }
+
+
+__all__ = ["HMSMultiModalGNN"]

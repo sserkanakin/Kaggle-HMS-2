@@ -1,2 +1,9 @@
 docs/
 data/
+
+.pytest_cache
+
+.vscode
+
+docs/
+

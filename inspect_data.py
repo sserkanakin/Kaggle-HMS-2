@@ -5,7 +5,6 @@ Shows statistics and examples of processed graphs.
 
 import torch
 from pathlib import Path
-import sys
 
 
 def inspect_processed_data():
@@ -25,30 +24,58 @@ def inspect_processed_data():
     # Load metadata
     metadata_path = processed_dir / "metadata.pt"
     if not metadata_path.exists():
-        print("\n❌ Error: metadata.pt not found!")
-        return
-    
-    print("\n[1] Loading metadata...")
-    metadata = torch.load(metadata_path)
+        print("\n⚠️  Warning: metadata.pt not found!")
+        print("   Metadata will be created from existing patient files...")
+        
+        # Count patient files manually
+        patient_files = list(processed_dir.glob("patient_*.pt"))
+        if len(patient_files) == 0:
+            print("\n❌ Error: No patient files found!")
+            print("   Please run preprocessing first:")
+            print("   python src/data/make_dataset.py")
+            return
+        
+        patient_ids = [int(f.stem.split('_')[1]) for f in patient_files]
+        
+        # Load first patient as example
+        example_patient_id = patient_ids[0]
+        patient_path = processed_dir / f"patient_{example_patient_id}.pt"
+        patient_data = torch.load(patient_path, weights_only=False)
+        
+        print(f"\n  Found {len(patient_files)} patient files")
+        print(f"  Metadata is being updated as preprocessing continues...")
+        
+        metadata = {
+            'n_patients': len(patient_files),
+            'n_samples': 'Unknown (being processed)',
+            'patient_ids': sorted(patient_ids),
+        }
+    else:
+        print("\n[1] Loading metadata...")
+        metadata = torch.load(metadata_path, weights_only=False)
     
     print(f"\n  Dataset Statistics:")
     print(f"  {'─' * 60}")
     print(f"  Total patients:        {metadata['n_patients']:,}")
-    print(f"  Total samples:         {metadata['n_samples']:,}")
-    print(f"  Avg samples/patient:   {metadata['n_samples'] / metadata['n_patients']:.1f}")
+    if isinstance(metadata['n_samples'], int):
+        print(f"  Total samples:         {metadata['n_samples']:,}")
+        print(f"  Avg samples/patient:   {metadata['n_samples'] / metadata['n_patients']:.1f}")
+    else:
+        print(f"  Total samples:         {metadata['n_samples']}")
     
-    # Samples per patient distribution
-    samples_per_patient = list(metadata['samples_per_patient'].values())
-    print(f"\n  Samples per patient distribution:")
-    print(f"    Min:     {min(samples_per_patient)}")
-    print(f"    Max:     {max(samples_per_patient)}")
-    print(f"    Median:  {sorted(samples_per_patient)[len(samples_per_patient)//2]}")
+    # Samples per patient distribution (if available)
+    if 'samples_per_patient' in metadata:
+        samples_per_patient = list(metadata['samples_per_patient'].values())
+        print(f"\n  Samples per patient distribution:")
+        print(f"    Min:     {min(samples_per_patient)}")
+        print(f"    Max:     {max(samples_per_patient)}")
+        print(f"    Median:  {sorted(samples_per_patient)[len(samples_per_patient)//2]}")
     
     # Load example patient
     print("\n[2] Loading example patient data...")
     example_patient_id = metadata['patient_ids'][0]
     patient_path = processed_dir / f"patient_{example_patient_id}.pt"
-    patient_data = torch.load(patient_path)
+    patient_data = torch.load(patient_path, weights_only=False)
     
     print(f"\n  Patient ID: {example_patient_id}")
     print(f"  Number of samples: {len(patient_data)}")
@@ -112,7 +139,7 @@ def inspect_processed_data():
     for patient_id in metadata['patient_ids'][:10]:  # Sample first 10 patients
         patient_path = processed_dir / f"patient_{patient_id}.pt"
         if patient_path.exists():
-            patient_data = torch.load(patient_path)
+            patient_data = torch.load(patient_path, weights_only=False)
             for label_id, sample in patient_data.items():
                 class_counts[sample['target']] += 1
     

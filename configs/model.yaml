@@ -1,0 +1,105 @@
+# Multi-modal GNN Model Configuration for HMS Brain Activity Classification
+
+model:
+  num_classes: 6 # Seizure, LPD, GPD, LRDA, GRDA, Other
+
+  # EEG Encoder Configuration
+  # Processes 9 temporal EEG graphs (each with 19 nodes)
+  eeg_encoder:
+    in_channels: 5 # Node features: [delta, theta, alpha, beta, gamma]
+
+    # GAT parameters
+    gat_hidden_dim: 64
+    gat_out_dim: 64
+    gat_num_layers: 2
+    gat_heads: 4 # Multi-head attention
+    gat_dropout: 0.3
+    use_edge_attr: true # Use coherence as edge weights
+
+    # BiLSTM parameters
+    rnn_hidden_dim: 128
+    rnn_num_layers: 2
+    rnn_dropout: 0.2
+    bidirectional: true # Output dim will be 256 (128 * 2)
+
+    # Pooling method for graph-level features
+    pooling_method: "mean" # Options: "mean", "max", "add"
+
+  # Spectrogram Encoder Configuration
+  # Processes 119 temporal spectrogram graphs (each with 4 nodes)
+  spec_encoder:
+    in_channels: 5 # Node features: [delta, theta, alpha, beta, gamma]
+
+    # GAT parameters
+    gat_hidden_dim: 64
+    gat_out_dim: 64
+    gat_num_layers: 2
+    gat_heads: 4
+    gat_dropout: 0.3
+    use_edge_attr: false # Fixed spatial edges, no weights needed
+
+    # BiLSTM parameters
+    rnn_hidden_dim: 128
+    rnn_num_layers: 2
+    rnn_dropout: 0.2
+    bidirectional: true # Output dim will be 256 (128 * 2)
+
+    # Pooling method
+    pooling_method: "mean"
+
+  # Cross-Modal Fusion Configuration
+  # Fuses EEG (256-dim) and Spectrogram (256-dim) features
+  fusion:
+    hidden_dim: 256 # Projection dimension for attention
+    num_heads: 8 # Multi-head cross-attention
+    dropout: 0.2
+    # Output dim will be 512 (256 + 256 concatenated)
+
+  # Classifier Configuration
+  # Maps fused features (512-dim) to 6 classes
+  classifier:
+    hidden_dims: [256, 128] # Two hidden layers
+    dropout: 0.3
+    activation: "elu" # Options: "relu", "gelu", "elu"
+
+# Training hyperparameters (for reference, used in Lightning module)
+training:
+  batch_size: 32
+  num_epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+  # Learning rate scheduler
+  scheduler:
+    type: "ReduceLROnPlateau" # Options: "ReduceLROnPlateau", "CosineAnnealing", "StepLR"
+    patience: 5
+    factor: 0.5
+    min_lr: 0.00001
+
+  # Early stopping
+  early_stopping:
+    patience: 10
+    monitor: "val_loss"
+    mode: "min"
+
+  # Class weights for imbalanced dataset
+  use_class_weights: true
+
+  # Loss function
+  loss: "CrossEntropyLoss" # Options: "CrossEntropyLoss", "FocalLoss"
+
+# Data split configuration
+data:
+  data_dir: "data/processed"
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  shuffle_seed: 42
+  num_workers: 4
+  pin_memory: true
+
+# Hardware configuration
+hardware:
+  device: "cuda" # Options: "cuda", "cpu", "mps"
+  mixed_precision: true # Use automatic mixed precision (AMP)
+  compile_model: false # Use torch.compile() if available
