@@ -113,7 +113,7 @@ spectrogram:
 
 # Data paths
 paths:
-  train_csv: "data/raw/train.csv"
+  train_csv: "data/raw/train_unique.csv" # Using deduplicated dataset (~20k samples)
   train_eegs: "data/raw/train_eegs"
   train_spectrograms: "data/raw/train_spectrograms"
   processed_dir: "data/processed"

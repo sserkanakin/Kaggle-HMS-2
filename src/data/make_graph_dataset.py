@@ -354,9 +354,14 @@ def process_all_data(config, n_workers=None):
     all_patients = set(train_df['patient_id'].unique())
     patients_to_process = all_patients - existing_patients
     
-    print(f"  Total unique patients: {len(all_patients)}")
-    print(f"  Already processed: {len(existing_patients)}")
-    print(f"  To process: {len(patients_to_process)}")
+    # Calculate total samples
+    total_samples = len(train_df)
+    samples_to_process = len(train_df[train_df['patient_id'].isin(patients_to_process)])
+    already_processed_samples = total_samples - samples_to_process
+    
+    print(f"  Total samples: {total_samples}")
+    print(f"  Already processed: {already_processed_samples} samples ({len(existing_patients)} patients)")
+    print(f"  To process: {samples_to_process} samples ({len(patients_to_process)} patients)")
     
     # Convert config to dict for multiprocessing
     config_dict = OmegaConf.to_container(config, resolve=True)
@@ -370,10 +375,13 @@ def process_all_data(config, n_workers=None):
     # Group train_df by patient_id
     grouped_by_patient = train_df.groupby('patient_id')
     
-    print(f"\n  Processing patients with {n_workers} workers...")
+    print(f"\n  Processing with {n_workers} workers...")
     print(f"  Metadata will be updated every 100 patients")
     
-    for patient_id in tqdm(sorted(all_patients), desc="Patients"):
+    # Create progress bar based on total samples
+    pbar = tqdm(total=samples_to_process, desc="Processing samples", unit="sample")
+    
+    for patient_id in sorted(all_patients):
         # Skip if this patient is already processed
         if patient_id in existing_patients:
             patient_samples = grouped_by_patient.get_group(patient_id)
@@ -382,6 +390,7 @@ def process_all_data(config, n_workers=None):
         
         # Get all samples for this patient
         patient_samples = grouped_by_patient.get_group(patient_id)
+        num_patient_samples = len(patient_samples)
         
         # Prepare arguments for multiprocessing
         args_list = [
@@ -411,6 +420,9 @@ def process_all_data(config, n_workers=None):
             else:
                 failed_count += 1
         
+        # Update progress bar
+        pbar.update(num_patient_samples)
+        
         # Save patient file
         if patient_data:
             output_path = output_dir / f"patient_{patient_id}.pt"
@@ -420,7 +432,10 @@ def process_all_data(config, n_workers=None):
             # Update metadata every 100 patients (instead of every patient)
             if saved_patients_count % 100 == 0:
                 update_metadata(output_dir, config)
-                print(f"\n  [Checkpoint] Saved {saved_patients_count} patients, updated metadata")
+                pbar.write(f"  [Checkpoint] Saved {saved_patients_count} patients, updated metadata")
+    
+    # Close progress bar
+    pbar.close()
     
     print(f"\n  ✓ Successfully processed: {success_count} samples")
     print(f"  ⊘ Skipped (already done): {skipped_count} samples")
