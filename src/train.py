@@ -7,6 +7,9 @@ from omegaconf import OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
+import os
+import resource
+import torch.multiprocessing as _mp
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -60,6 +63,32 @@ def train(
         _os.environ.setdefault("WANDB_MODE", "offline")
         print("[Info] WANDB_MODE=offline (no internet required)")
     
+    # Environment & multiprocessing tuning to avoid 'Too many open files' and shared-memory errors
+    # - Limit intra-op/OpenMP threads per worker
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    # Try to raise the soft RLIMIT_NOFILE if permitted (helps with many shared-memory fds)
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = 65536
+        new_soft = min(target, hard) if hard != resource.RLIM_INFINITY else target
+        if new_soft > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+            print(f"[Info] Increased RLIMIT_NOFILE: {soft} -> {new_soft} (hard={hard})")
+        else:
+            print(f"[Info] RLIMIT_NOFILE soft={soft}, hard={hard} (no change)")
+    except Exception as e:
+        print(f"[Warning] Could not increase RLIMIT_NOFILE: {e}")
+
+    # Prefer file_system sharing strategy to reduce open fd pressure on some systems
+    try:
+        _mp.set_sharing_strategy('file_system')
+        print('[Info] torch.multiprocessing sharing strategy set to file_system')
+    except Exception as e:
+        print(f"[Warning] Could not set torch.multiprocessing sharing strategy: {e}")
     # Initialize DataModule
     print("Initializing DataModule...")
     dm_batch_size = batch_size_override if batch_size_override is not None else config.training.batch_size
