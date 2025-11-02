@@ -36,6 +36,7 @@ def train(
     num_workers_override: int | None = None,
     prefetch_factor_override: int | None = None,
     pin_memory_override: bool | None = None,
+    mp_sharing_strategy: str = "auto",  # 'auto' | 'file_descriptor' | 'file_system'
 ):
     """Train HMS Multi-Modal GNN model.
     
@@ -97,10 +98,16 @@ def train(
     except Exception as e:
         print(f"[Warning] Could not increase RLIMIT_NOFILE: {e}")
 
-    # Prefer file_system sharing strategy to reduce open fd pressure on some systems
+    # Choose multiprocessing sharing strategy to avoid /dev/shm mmap issues
+    # 'file_descriptor' reduces reliance on shared filenames in /dev/shm
     try:
-        _mp.set_sharing_strategy('file_system')
-        print('[Info] torch.multiprocessing sharing strategy set to file_system')
+        effective_pin = pin_memory_override if pin_memory_override is not None else config.data.pin_memory
+        if mp_sharing_strategy == 'file_descriptor' or (mp_sharing_strategy == 'auto' and effective_pin):
+            _mp.set_sharing_strategy('file_descriptor')
+            print('[Info] torch.multiprocessing sharing strategy set to file_descriptor')
+        else:
+            _mp.set_sharing_strategy('file_system')
+            print('[Info] torch.multiprocessing sharing strategy set to file_system')
     except Exception as e:
         print(f"[Warning] Could not set torch.multiprocessing sharing strategy: {e}")
     # Initialize DataModule
@@ -367,6 +374,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable pin_memory in DataLoaders to reduce host memory pressure",
     )
+    parser.add_argument(
+        "--mp-sharing-strategy",
+        type=str,
+        default="auto",
+        choices=["auto", "file_descriptor", "file_system"],
+        help="Multiprocessing sharing strategy to use for PyTorch (auto prefers file_descriptor when pin_memory is enabled)",
+    )
     
     args = parser.parse_args()
     
@@ -386,4 +400,5 @@ if __name__ == "__main__":
         num_workers_override=args.num_workers,
         prefetch_factor_override=args.prefetch_factor,
         pin_memory_override=(False if args.disable_pin_memory else None),
+        mp_sharing_strategy=args.mp_sharing_strategy,
     )
