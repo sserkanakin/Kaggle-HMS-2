@@ -21,6 +21,14 @@ def train(
     wandb_project: str = "hms-brain-activity",
     wandb_name: str | None = None,
     resume_from_checkpoint: str | None = None,
+    *,
+    smoke: bool = False,
+    offline: bool = False,
+    limit_train_batches: int | float | None = None,
+    limit_val_batches: int | float | None = None,
+    max_epochs_override: int | None = None,
+    batch_size_override: int | None = None,
+    num_workers_override: int | None = None,
 ):
     """Train HMS Multi-Modal GNN model.
     
@@ -45,23 +53,39 @@ def train(
     print(f"WandB Project: {wandb_project}")
     print(f"WandB Run: {wandb_name or 'auto-generated'}")
     print("="*60 + "\n")
+
+    # Smoke/offline adjustments
+    if offline or smoke:
+        import os as _os
+        _os.environ.setdefault("WANDB_MODE", "offline")
+        print("[Info] WANDB_MODE=offline (no internet required)")
     
     # Initialize DataModule
     print("Initializing DataModule...")
+    dm_batch_size = batch_size_override if batch_size_override is not None else config.training.batch_size
+    dm_num_workers = num_workers_override if num_workers_override is not None else config.data.num_workers
+    if smoke:
+        dm_batch_size = min(2, dm_batch_size)
+        dm_num_workers = 0
+
     datamodule = HMSDataModule(
         data_dir=config.data.get('data_dir', 'data/processed'),
-        batch_size=config.training.batch_size,
-        train_ratio=config.data.train_ratio,
-        val_ratio=config.data.val_ratio,
-        test_ratio=config.data.test_ratio,
-        num_workers=config.data.num_workers,
+        train_csv=config.data.get('train_csv', 'data/raw/train_unique.csv'),
+        batch_size=dm_batch_size,
+        n_folds=config.data.get('n_folds', 5),
+        current_fold=config.data.get('current_fold', 0),
+        stratify_by_evaluators=config.data.get('stratify_by_evaluators', True),
+        evaluator_bins=list(config.data.get('evaluator_bins', [0, 5, 10, 15, 20, 999])),
+        min_evaluators=config.data.get('min_evaluators', 0),
+        num_workers=dm_num_workers,
         pin_memory=config.data.pin_memory,
         shuffle_seed=config.data.shuffle_seed,
+        compute_class_weights=(not smoke),
     )
     
-    # Setup to get class weights
+    # Setup datasets; optionally get class weights
     datamodule.setup(stage="fit")
-    class_weights = datamodule.get_class_weights() if config.training.use_class_weights else None
+    class_weights = datamodule.get_class_weights() if (not smoke and config.training.use_class_weights) else None
     
     # Initialize Lightning Module
     print("Initializing Model...")
@@ -89,7 +113,7 @@ def train(
         project=wandb_project,
         name=wandb_name,
         save_dir="logs",
-        log_model=True,  # Log model checkpoints to WandB
+        log_model=True,
     )
     
     # Log configuration to WandB
@@ -126,15 +150,18 @@ def train(
     
     # Trainer
     trainer = Trainer(
-        max_epochs=config.training.num_epochs,
-        accelerator="auto",  # Auto-detect GPU/CPU/MPS
+        max_epochs=(max_epochs_override if max_epochs_override is not None else (1 if smoke else config.training.num_epochs)),
+        accelerator="auto",
         devices=1,
         logger=wandb_logger,
         callbacks=callbacks,
-        precision=16 if config.hardware.mixed_precision else 32,
-        gradient_clip_val=1.0,  # Clip gradients to prevent exploding gradients
+        precision=16 if getattr(config, 'hardware', None) and getattr(config.hardware, 'mixed_precision', False) else 32,
+        gradient_clip_val=1.0,
         log_every_n_steps=10,
-        deterministic=False,  # Set to True for reproducibility (slower)
+        deterministic=False,
+        limit_train_batches=(limit_train_batches if limit_train_batches is not None else (2 if smoke else 1.0)),
+        limit_val_batches=(limit_val_batches if limit_val_batches is not None else (1 if smoke else 1.0)),
+        num_sanity_val_steps=(0 if smoke else 2),
     )
     
     # Train
@@ -147,6 +174,8 @@ def train(
     
     # Test on best model
     print("\nTesting best model...\n")
+    # Ensure test split is prepared (uses validation fold by default)
+    datamodule.setup(stage="test")
     trainer.test(
         model,
         datamodule=datamodule,
@@ -190,6 +219,46 @@ if __name__ == "__main__":
         default=None,
         help="Path to checkpoint to resume from",
     )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run a fast smoke test (1 epoch, 2 train batches, 1 val batch, WANDB offline)",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Force WANDB offline mode",
+    )
+    parser.add_argument(
+        "--limit-train-batches",
+        type=float,
+        default=None,
+        help="Override limit_train_batches for Trainer (float fraction or int)",
+    )
+    parser.add_argument(
+        "--limit-val-batches",
+        type=float,
+        default=None,
+        help="Override limit_val_batches for Trainer (float fraction or int)",
+    )
+    parser.add_argument(
+        "--max-epochs",
+        type=int,
+        default=None,
+        help="Override max_epochs for Trainer",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override batch size for DataModule",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Override num_workers for DataModule",
+    )
     
     args = parser.parse_args()
     
@@ -198,4 +267,11 @@ if __name__ == "__main__":
         wandb_project=args.wandb_project,
         wandb_name=args.wandb_name,
         resume_from_checkpoint=args.resume,
+        smoke=args.smoke,
+        offline=args.offline,
+        limit_train_batches=args.limit_train_batches,
+        limit_val_batches=args.limit_val_batches,
+        max_epochs_override=args.max_epochs,
+        batch_size_override=args.batch_size,
+        num_workers_override=args.num_workers,
     )

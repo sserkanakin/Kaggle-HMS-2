@@ -5,9 +5,10 @@ Processes all data and saves graphs grouped by patient_id.
 
 import os
 import sys
+import gc
 
 from pathlib import Path
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, set_start_method, get_context
 
 import pandas as pd
 import torch
@@ -63,10 +64,13 @@ def process_single_label(
         eeg_offset = int(row.eeg_label_offset_seconds)
         eeg_start_idx = eeg_offset * 200  # 200 Hz sampling rate
         eeg_end_idx = eeg_start_idx + (50 * 200)  # 50 seconds
-        eeg_window_df = eeg_df.iloc[eeg_start_idx:eeg_end_idx]
+        eeg_window_df = eeg_df.iloc[eeg_start_idx:eeg_end_idx].copy()
         
         # Select channels and convert to numpy
         eeg_array = select_eeg_channels(eeg_window_df, eeg_channels)
+        
+        # Clean up DataFrames to close file handles
+        del eeg_df, eeg_window_df
         
         # Validate shape
         if eeg_array.shape[0] != 10000:
@@ -75,6 +79,9 @@ def process_single_label(
         
         # Build EEG graphs (9 temporal windows)
         eeg_graphs = eeg_builder.process_eeg_signal(eeg_array)
+        
+        # Clean up array
+        del eeg_array
         
         # === Load and extract Spectrogram window ===
         spec_path = os.path.join(spec_dir, f"{row.spectrogram_id}.parquet")
@@ -93,10 +100,14 @@ def process_single_label(
         # Validate
         if len(spec_window_df) == 0:
             print(f"Warning: Empty spectrogram for label_id {row.label_id}")
+            del spec_df, spec_window_df
             return None
         
         # Build Spectrogram graphs (119 temporal windows)
         spec_graphs = spec_builder.process_spectrogram(spec_window_df)
+        
+        # Clean up DataFrames
+        del spec_df, spec_window_df
         
         # === Get target label ===
         label_str = row.expert_consensus.strip()
@@ -107,7 +118,7 @@ def process_single_label(
             return None
         
         # === Return processed data ===
-        return {
+        result = {
             'eeg_graphs': eeg_graphs,
             'spec_graphs': spec_graphs,
             'target': target,
@@ -115,8 +126,14 @@ def process_single_label(
             'patient_id': row.patient_id
         }
         
+        # Force garbage collection before returning
+        gc.collect()
+        
+        return result
+        
     except Exception as e:
         print(f"Error processing label_id {row.label_id}: {str(e)}")
+        gc.collect()
         return None
 
 
@@ -236,7 +253,7 @@ def process_single_label_wrapper(args):
         clip_max=config_dict['spectrogram']['preprocessing']['clip_max']
     )
     
-    return process_single_label(
+    result = process_single_label(
         row=row,
         eeg_builder=eeg_builder,
         spec_builder=spec_builder,
@@ -246,6 +263,110 @@ def process_single_label_wrapper(args):
         spec_regions=config_dict['spectrogram']['regions'],
         label_to_index=config_dict['label_to_index']
     )
+    
+    # Force garbage collection to free file handles
+    gc.collect()
+    
+    return result
+
+
+def process_patient_worker(args):
+    """
+    Worker to process all samples for a single patient and save directly to disk.
+
+    Args:
+        args: Tuple of (
+            patient_id: int,
+            rows_dicts: list[dict],   # one dict per row/sample for this patient
+            config_dict: dict,        # resolved OmegaConf as plain dict
+            output_dir: str           # directory to save patient file
+        )
+
+    Returns:
+        dict: Summary containing patient_id, n_samples, success, failed, saved
+    """
+    patient_id, rows_dicts, config_dict, output_dir = args
+
+    # Rebuild builders inside the process
+    eeg_builder = EEGGraphBuilder(
+        sampling_rate=config_dict['eeg']['sampling_rate'],
+        window_size=config_dict['eeg']['window_size'],
+        stride=config_dict['eeg']['stride'],
+        bands=config_dict['eeg']['bands'],
+        coherence_threshold=config_dict['eeg']['coherence']['threshold'],
+        nperseg_factor=config_dict['eeg']['coherence']['nperseg_factor'],
+        channels=config_dict['eeg']['channels'],
+        apply_bandpass=config_dict['eeg']['preprocessing']['bandpass_filter']['enabled'],
+        bandpass_low=config_dict['eeg']['preprocessing']['bandpass_filter']['lowcut'],
+        bandpass_high=config_dict['eeg']['preprocessing']['bandpass_filter']['highcut'],
+        bandpass_order=config_dict['eeg']['preprocessing']['bandpass_filter']['order'],
+        apply_notch=config_dict['eeg']['preprocessing']['notch_filter']['enabled'],
+        notch_freq=config_dict['eeg']['preprocessing']['notch_filter']['frequency'],
+        notch_q=config_dict['eeg']['preprocessing']['notch_filter']['quality_factor'],
+        apply_normalize=config_dict['eeg']['preprocessing']['normalize']['enabled']
+    )
+
+    spec_builder = SpectrogramGraphBuilder(
+        window_size=config_dict['spectrogram']['window_size'],
+        stride=config_dict['spectrogram']['stride'],
+        regions=config_dict['spectrogram']['regions'],
+        bands=config_dict['spectrogram']['bands'],
+        aggregation=config_dict['spectrogram']['aggregation'],
+        spatial_edges=config_dict['spectrogram']['spatial_edges'],
+        apply_preprocessing=config_dict['spectrogram']['preprocessing']['enabled'],
+        clip_min=config_dict['spectrogram']['preprocessing']['clip_min'],
+        clip_max=config_dict['spectrogram']['preprocessing']['clip_max']
+    )
+
+    success = 0
+    failed = 0
+    patient_data = {}
+
+    for row_dict in rows_dicts:
+        row = pd.Series(row_dict)
+        result = process_single_label(
+            row=row,
+            eeg_builder=eeg_builder,
+            spec_builder=spec_builder,
+            eeg_dir=config_dict['paths']['train_eegs'],
+            spec_dir=config_dict['paths']['train_spectrograms'],
+            eeg_channels=config_dict['eeg']['channels'],
+            spec_regions=config_dict['spectrogram']['regions'],
+            label_to_index=config_dict['label_to_index']
+        )
+
+        if result is not None:
+            label_id = result['label_id']
+            patient_data[label_id] = {
+                'eeg_graphs': result['eeg_graphs'],
+                'spec_graphs': result['spec_graphs'],
+                'target': result['target']
+            }
+            success += 1
+        else:
+            failed += 1
+
+        # Periodic GC to keep memory in check
+        if (success + failed) % 5 == 0:
+            gc.collect()
+
+    # Save patient file if any data processed
+    saved = False
+    if patient_data:
+        output_path = Path(output_dir) / f"patient_{patient_id}.pt"
+        torch.save(patient_data, output_path)
+        saved = True
+        # Free memory
+        del patient_data
+        gc.collect()
+
+    return {
+        'patient_id': patient_id,
+        'n_samples': len(rows_dicts),
+        'success': success,
+        'failed': failed,
+        'saved': saved,
+    }
 
 
 def process_all_data(config, n_workers=None):
@@ -261,10 +382,20 @@ def process_all_data(config, n_workers=None):
     print("HMS EEG/Spectrogram Graph Preprocessing Pipeline")
     print("=" * 80)
     
-    # Set number of workers
+    # Set number of workers - optimized for 20-core systems with large RAM
     if n_workers is None:
-        n_workers = max(1, cpu_count() - 1)
+        # Use 8 workers by default for good balance of speed and stability
+        n_workers = min(8, max(1, cpu_count() - 1))
+    
+    # Warn if using too many workers
+    if n_workers > 12:
+        print(f"\n⚠️  WARNING: Using {n_workers} workers may cause memory or file issues!")
+        print(f"   Recommended: 6-8 workers for optimal performance")
+        print(f"   If you encounter errors, try: --workers 6")
+    
     print(f"\nUsing {n_workers} worker processes")
+    print(f"Workers will restart every 10 tasks to free memory")
+    print(f"Optimized for {cpu_count()}-core system")
     
     # === Check for existing processed data ===
     output_dir = Path(config.paths.processed_dir)
@@ -372,68 +503,56 @@ def process_all_data(config, n_workers=None):
     skipped_count = 0
     saved_patients_count = 0
     
-    # Group train_df by patient_id
+    # Group train_df by patient_id once
     grouped_by_patient = train_df.groupby('patient_id')
-    
+
     print(f"\n  Processing with {n_workers} workers...")
     print(f"  Metadata will be updated every 100 patients")
-    
-    # Create progress bar based on total samples
-    pbar = tqdm(total=samples_to_process, desc="Processing samples", unit="sample")
-    
+
+    # Build work list per-patient (exclude already processed patients)
+    work_items = []
     for patient_id in sorted(all_patients):
-        # Skip if this patient is already processed
         if patient_id in existing_patients:
             patient_samples = grouped_by_patient.get_group(patient_id)
             skipped_count += len(patient_samples)
             continue
-        
-        # Get all samples for this patient
         patient_samples = grouped_by_patient.get_group(patient_id)
-        num_patient_samples = len(patient_samples)
-        
-        # Prepare arguments for multiprocessing
-        args_list = [
-            (row.to_dict(), config_dict) 
-            for _, row in patient_samples.iterrows()
-        ]
-        
-        # Process samples for this patient in parallel
-        if n_workers > 1:
-            with Pool(processes=n_workers) as pool:
-                results = pool.map(process_single_label_wrapper, args_list)
-        else:
-            # Single-threaded for debugging
-            results = [process_single_label_wrapper(args) for args in args_list]
-        
-        # Collect results into patient data
-        patient_data = {}
-        for result in results:
-            if result is not None:
-                label_id = result['label_id']
-                patient_data[label_id] = {
-                    'eeg_graphs': result['eeg_graphs'],
-                    'spec_graphs': result['spec_graphs'],
-                    'target': result['target']
-                }
-                success_count += 1
-            else:
-                failed_count += 1
-        
-        # Update progress bar
-        pbar.update(num_patient_samples)
-        
-        # Save patient file
-        if patient_data:
-            output_path = output_dir / f"patient_{patient_id}.pt"
-            torch.save(patient_data, output_path)
-            saved_patients_count += 1
-            
-            # Update metadata every 100 patients (instead of every patient)
-            if saved_patients_count % 100 == 0:
+        rows_dicts = [row.to_dict() for _, row in patient_samples.iterrows()]
+        work_items.append((int(patient_id), rows_dicts, config_dict, str(output_dir)))
+
+    # Progress bar over total samples to process
+    pbar = tqdm(total=samples_to_process, desc="Processing samples", unit="sample")
+
+    if n_workers > 1:
+        with Pool(processes=n_workers, maxtasksperchild=10) as pool:
+            # Stream results as they complete
+            for summary in pool.imap_unordered(process_patient_worker, work_items, chunksize=1):
+                success_count += summary['success']
+                failed_count += summary['failed']
+                if summary['saved']:
+                    saved_patients_count += 1
+                # Update by number of samples for this patient
+                pbar.update(summary['n_samples'])
+                
+                # Periodic metadata update
+                if saved_patients_count > 0 and saved_patients_count % 100 == 0:
+                    update_metadata(output_dir, config)
+                    gc.collect()
+                    pbar.write(f"  [Checkpoint] Saved {saved_patients_count} patients, updated metadata")
+    else:
+        # Single-process fallback
+        for item in work_items:
+            summary = process_patient_worker(item)
+            success_count += summary['success']
+            failed_count += summary['failed']
+            if summary['saved']:
+                saved_patients_count += 1
+            pbar.update(summary['n_samples'])
+            if saved_patients_count > 0 and saved_patients_count % 100 == 0:
                 update_metadata(output_dir, config)
+                gc.collect()
                 pbar.write(f"  [Checkpoint] Saved {saved_patients_count} patients, updated metadata")
-    
+
     # Close progress bar
     pbar.close()
     
@@ -472,7 +591,7 @@ def main():
         '--workers', '-w',
         type=int,
         default=None,
-        help=f'Number of worker processes (default: CPU count - 1 = {max(1, cpu_count() - 1)})'
+        help=f'Number of worker processes (default: min(8, CPU count - 1) = {min(8, max(1, cpu_count() - 1))}). Recommended: 6-8 for 20-core systems.'
     )
     parser.add_argument(
         '--config',
@@ -485,6 +604,10 @@ def main():
     
     # Load configuration
     config = load_config(args.config)
+    
+    # Set a reasonable default for workers (8 for good performance on multi-core systems)
+    if args.workers is None:
+        args.workers = min(8, max(1, cpu_count() - 1))
     
     # Process all data
     process_all_data(config, n_workers=args.workers)

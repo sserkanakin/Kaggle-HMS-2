@@ -61,6 +61,7 @@ class HMSDataModule(LightningDataModule):
         num_workers: int = 4,
         pin_memory: bool = True,
         shuffle_seed: int = 42,
+        compute_class_weights: bool = True,
     ) -> None:
         super().__init__()
         
@@ -75,16 +76,18 @@ class HMSDataModule(LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.shuffle_seed = shuffle_seed
+        self.compute_class_weights = compute_class_weights
         
         # Validate inputs
         assert 0 <= current_fold < n_folds, \
             f"current_fold must be in [0, {n_folds-1}], got {current_fold}"
         
         # Will be set in setup()
-        self.train_dataset: Optional[HMSDataset] = None
-        self.val_dataset: Optional[HMSDataset] = None
-        self.class_weights: Optional[torch.Tensor] = None
-        self.metadata_df: Optional[pd.DataFrame] = None
+        self.train_dataset = None  # type: Optional[HMSDataset]
+        self.val_dataset = None    # type: Optional[HMSDataset]
+        self.class_weights = None  # type: Optional[torch.Tensor]
+        self.metadata_df = None    # type: Optional[pd.DataFrame]
+        self.test_dataset = None   # type: Optional[HMSDataset]
         
     def setup(self, stage: Optional[str] = None) -> None:
         """Setup datasets for each stage.
@@ -184,13 +187,14 @@ class HMSDataModule(LightningDataModule):
                 is_train=False,
             )
             
-            # Compute class weights from training set
-            self.class_weights = self.train_dataset.get_class_weights()
-            
-            # Get unique patients
+            # Compute class weights from training set (optional)
+            if self.compute_class_weights:
+                self.class_weights = self.train_dataset.get_class_weights()
+            else:
+                self.class_weights = None
+            # Stats and logging
             train_patients = train_df['patient_id'].nunique()
             val_patients = val_df['patient_id'].nunique()
-            
             print(f"\n{'='*60}")
             print(f"Dataset Setup - Fold {self.current_fold}/{self.n_folds-1}:")
             print(f"  Train: {train_patients} patients, {len(self.train_dataset)} samples")
@@ -200,8 +204,22 @@ class HMSDataModule(LightningDataModule):
                 for fold_df, name in [(train_df, 'Train'), (val_df, 'Val')]:
                     bin_dist = fold_df['evaluator_bin'].value_counts().sort_index()
                     print(f"    {name}: {dict(bin_dist)}")
-            print(f"\n  Class weights: {self.class_weights.tolist()}")
+            if self.class_weights is not None:
+                print(f"\n  Class weights: {self.class_weights.tolist()}")
+            else:
+                print(f"\n  Class weights: None (skipped)")
             print(f"{'='*60}\n")
+
+        # For now, use the validation fold as test split
+        if stage == "test" or stage is None:
+            test_df = self.metadata_df[
+                self.metadata_df['fold'] == self.current_fold
+            ].reset_index(drop=True)
+            self.test_dataset = HMSDataset(
+                data_dir=self.data_dir,
+                metadata_df=test_df,
+                is_train=False,
+            )
     
     def train_dataloader(self) -> DataLoader:
         """Return training DataLoader."""
@@ -225,6 +243,21 @@ class HMSDataModule(LightningDataModule):
         
         return DataLoader(
             self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            collate_fn=collate_graphs,
+            persistent_workers=self.num_workers > 0,
+        )
+    
+    def test_dataloader(self) -> DataLoader:
+        """Return test DataLoader (uses validation fold by default)."""
+        if self.test_dataset is None:
+            raise RuntimeError("Test dataset not initialized. Call setup(stage='test') first.")
+        
+        return DataLoader(
+            self.test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
