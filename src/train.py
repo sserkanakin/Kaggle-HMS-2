@@ -37,6 +37,7 @@ def train(
     prefetch_factor_override: int | None = None,
     pin_memory_override: bool | None = None,
     mp_sharing_strategy: str = "auto",  # 'auto' | 'file_descriptor' | 'file_system'
+    accumulate_grad_batches_override: int | None = None,
 ):
     """Train HMS Multi-Modal GNN model.
     
@@ -251,6 +252,7 @@ def train(
         gradient_clip_val=1.0,
         log_every_n_steps=10,
         deterministic=False,
+        accumulate_grad_batches=(accumulate_grad_batches_override if accumulate_grad_batches_override is not None else getattr(config.training, 'accumulate_grad_batches', 1)),
         limit_train_batches=(limit_train_batches if limit_train_batches is not None else (2 if smoke else 1.0)),
         limit_val_batches=(limit_val_batches if limit_val_batches is not None else (1 if smoke else 1.0)),
         num_sanity_val_steps=(0 if smoke else 2),
@@ -381,6 +383,12 @@ if __name__ == "__main__":
         choices=["auto", "file_descriptor", "file_system"],
         help="Multiprocessing sharing strategy to use for PyTorch (auto prefers file_descriptor when pin_memory is enabled)",
     )
+    parser.add_argument(
+        "--accumulate-grad-batches",
+        type=int,
+        default=None,
+        help="Accumulate gradients over N batches to emulate larger global batch without increasing per-step memory",
+    )
     
     args = parser.parse_args()
     
@@ -401,4 +409,5 @@ if __name__ == "__main__":
         prefetch_factor_override=args.prefetch_factor,
         pin_memory_override=(False if args.disable_pin_memory else None),
         mp_sharing_strategy=args.mp_sharing_strategy,
+        accumulate_grad_batches_override=args.accumulate_grad_batches,
     )
