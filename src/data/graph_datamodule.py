@@ -59,6 +59,7 @@ class HMSDataModule(LightningDataModule):
         evaluator_bins: List[int] = [0, 5, 10, 15, 20, 999],
         min_evaluators: int = 0,
         num_workers: int = 4,
+        prefetch_factor: int = 4,
         pin_memory: bool = True,
         shuffle_seed: int = 42,
         compute_class_weights: bool = True,
@@ -74,6 +75,7 @@ class HMSDataModule(LightningDataModule):
         self.evaluator_bins = evaluator_bins
         self.min_evaluators = min_evaluators
         self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor
         self.pin_memory = pin_memory
         self.shuffle_seed = shuffle_seed
         self.compute_class_weights = compute_class_weights
@@ -226,8 +228,7 @@ class HMSDataModule(LightningDataModule):
         if self.train_dataset is None:
             raise RuntimeError("Train dataset not initialized. Call setup() first.")
         
-        return DataLoader(
-            self.train_dataset,
+        kwargs = dict(
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
@@ -235,14 +236,16 @@ class HMSDataModule(LightningDataModule):
             collate_fn=collate_graphs,
             persistent_workers=self.num_workers > 0,
         )
+        if self.num_workers > 0:
+            kwargs["prefetch_factor"] = self.prefetch_factor
+        return DataLoader(self.train_dataset, **kwargs)
     
     def val_dataloader(self) -> DataLoader:
         """Return validation DataLoader."""
         if self.val_dataset is None:
             raise RuntimeError("Validation dataset not initialized. Call setup() first.")
         
-        return DataLoader(
-            self.val_dataset,
+        kwargs = dict(
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
@@ -250,14 +253,16 @@ class HMSDataModule(LightningDataModule):
             collate_fn=collate_graphs,
             persistent_workers=self.num_workers > 0,
         )
+        if self.num_workers > 0:
+            kwargs["prefetch_factor"] = self.prefetch_factor
+        return DataLoader(self.val_dataset, **kwargs)
     
     def test_dataloader(self) -> DataLoader:
         """Return test DataLoader (uses validation fold by default)."""
         if self.test_dataset is None:
             raise RuntimeError("Test dataset not initialized. Call setup(stage='test') first.")
         
-        return DataLoader(
-            self.test_dataset,
+        kwargs = dict(
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
@@ -265,6 +270,9 @@ class HMSDataModule(LightningDataModule):
             collate_fn=collate_graphs,
             persistent_workers=self.num_workers > 0,
         )
+        if self.num_workers > 0:
+            kwargs["prefetch_factor"] = self.prefetch_factor
+        return DataLoader(self.test_dataset, **kwargs)
     
     def get_num_classes(self) -> int:
         """Return number of classes."""

@@ -39,11 +39,14 @@ class HMSDataset(Dataset):
         metadata_df: pd.DataFrame,
         is_train: bool = True,
         transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        patient_cache_size: int = 2,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.metadata_df = metadata_df.reset_index(drop=True)
         self.is_train = is_train
         self.transform = transform
+        self.patient_cache_size = max(0, int(patient_cache_size))
+        self._patient_cache: Dict[int, Dict[int, Dict[str, Any]]] = {}
         
         # Build index: list of indices into metadata_df
         self.sample_indices: List[int] = list(range(len(self.metadata_df)))
@@ -87,18 +90,41 @@ class HMSDataset(Dataset):
         patient_id = int(row['patient_id'])
         label_id = int(row['label_id'])
         
-        # Load patient file (use weights_only=False for PyG Data objects)
-        patient_path = self.data_dir / f"patient_{patient_id}.pt"
-        patient_data = torch.load(patient_path, weights_only=False)
+        # Load patient file with a small in-memory cache per worker
+        if patient_id in self._patient_cache:
+            patient_data = self._patient_cache[patient_id]
+        else:
+            patient_path = self.data_dir / f"patient_{patient_id}.pt"
+            patient_data = torch.load(patient_path, weights_only=False)
+            if self.patient_cache_size > 0:
+                # Maintain a small cache (LRU by insertion order)
+                if len(self._patient_cache) >= self.patient_cache_size:
+                    # pop first inserted key
+                    old_pid = next(iter(self._patient_cache))
+                    self._patient_cache.pop(old_pid, None)
+                self._patient_cache[patient_id] = patient_data
         
         # Get specific label data
         sample_data = patient_data[label_id]
         
+        # Build target probability vector from vote columns in metadata
+        vote_cols = ['seizure_vote', 'lpd_vote', 'gpd_vote', 'lrda_vote', 'grda_vote', 'other_vote']
+        votes = torch.tensor([float(row[c]) for c in vote_cols], dtype=torch.float32)
+        total = float(votes.sum().item())
+        if total > 0:
+            target_probs = votes / total
+        else:
+            # Fallback to one-hot of target if no votes available
+            target_idx = int(sample_data['target'])
+            target_probs = torch.zeros(6, dtype=torch.float32)
+            target_probs[target_idx] = 1.0
+
         # Construct sample
         sample = {
             'eeg_graphs': sample_data['eeg_graphs'],
             'spec_graphs': sample_data['spec_graphs'],
             'target': sample_data['target'],
+            'target_probs': target_probs,
             'patient_id': patient_id,
             'label_id': label_id,
         }
@@ -178,6 +204,7 @@ def collate_graphs(batch: List[Dict]) -> Dict:
     eeg_sequences = [sample['eeg_graphs'] for sample in batch]  # List[List[9 graphs]]
     spec_sequences = [sample['spec_graphs'] for sample in batch]  # List[List[119 graphs]]
     targets = torch.tensor([sample['target'] for sample in batch], dtype=torch.long)
+    target_probs = torch.stack([sample['target_probs'] for sample in batch], dim=0)  # (B, 6)
     patient_ids = [sample['patient_id'] for sample in batch]
     label_ids = [sample['label_id'] for sample in batch]
     
@@ -203,6 +230,7 @@ def collate_graphs(batch: List[Dict]) -> Dict:
         'eeg_graphs': batched_eeg_graphs,  # List[9] of Batch objects
         'spec_graphs': batched_spec_graphs,  # List[119] of Batch objects
         'targets': targets,  # (batch_size,)
+        'target_probs': target_probs,  # (batch_size, 6)
         'patient_ids': patient_ids,
         'label_ids': label_ids,
     }

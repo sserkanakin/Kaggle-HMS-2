@@ -48,6 +48,7 @@ class HMSLightningModule(LightningModule):
         weight_decay: float = 1e-4,
         class_weights: Optional[torch.Tensor] = None,
         scheduler_config: Optional[Dict[str, Any]] = None,
+        loss: str | None = None,
     ) -> None:
         super().__init__()
         
@@ -67,14 +68,21 @@ class HMSLightningModule(LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.scheduler_config = scheduler_config or {}
+        self.loss_type = (loss or 'kl').lower()  # 'kl' or 'cross_entropy'
         
         # Loss function
-        if class_weights is not None:
-            self.register_buffer('class_weights', class_weights)
-            self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+        if self.loss_type == 'cross_entropy':
+            if class_weights is not None:
+                self.register_buffer('class_weights', class_weights)
+                self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+            else:
+                self.class_weights = None
+                self.criterion = nn.CrossEntropyLoss()
         else:
+            # KL divergence between target probability distribution and predicted probabilities
+            # We'll compute via F.kl_div(log_softmax(logits), target_probs, reduction='batchmean')
             self.class_weights = None
-            self.criterion = nn.CrossEntropyLoss()
+            self.criterion = None  # handled inline
         
         # Metrics for each stage
         metrics = MetricCollection({
@@ -119,12 +127,20 @@ class HMSLightningModule(LightningModule):
         eeg_graphs = batch['eeg_graphs']
         spec_graphs = batch['spec_graphs']
         targets = batch['targets']
+        target_probs = batch.get('target_probs', None)
         
         # Forward pass
         logits = self(eeg_graphs, spec_graphs)
         
         # Compute loss
-        loss = self.criterion(logits, targets)
+        if self.loss_type == 'kl':
+            if target_probs is None:
+                raise RuntimeError("Batch missing 'target_probs' required for KL loss")
+            log_probs = F.log_softmax(logits, dim=1)
+            # reduction='batchmean' matches Kaggle metric scaling
+            loss = F.kl_div(log_probs, target_probs, reduction='batchmean')
+        else:
+            loss = self.criterion(logits, targets)
         
         # Get predictions
         preds = torch.argmax(logits, dim=1)
@@ -140,11 +156,12 @@ class HMSLightningModule(LightningModule):
             metrics = self.test_metrics(preds, targets)
             self.test_acc_per_class(preds, targets)
         
-        # Log loss
-        self.log(f'{stage}/loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        # Log loss (provide batch_size to avoid ambiguous batch size warning)
+        self.log(f'{stage}/loss', loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=targets.size(0))
         
-        # Log metrics
-        self.log_dict(metrics, on_step=False, on_epoch=True, prog_bar=True)
+        # Log metrics with explicit batch_size to avoid ambiguous batch size warning
+        for k, v in metrics.items():
+            self.log(k, v, on_step=False, on_epoch=True, prog_bar=True, batch_size=targets.size(0))
         
         return loss
     
@@ -159,6 +176,21 @@ class HMSLightningModule(LightningModule):
     def test_step(self, batch: Dict, batch_idx: int):
         """Test step."""
         return self._shared_step(batch, batch_idx, 'test')
+
+    def transfer_batch_to_device(self, batch: Dict[str, Any], device: torch.device, dataloader_idx: int) -> Dict[str, Any]:
+        """Move PyG Batch objects and tensors to the target device.
+        Lightning doesn't automatically move custom objects like torch_geometric Batch.
+        """
+        batch = dict(batch)  # shallow copy
+        if 'eeg_graphs' in batch:
+            batch['eeg_graphs'] = [g.to(device, non_blocking=True) for g in batch['eeg_graphs']]
+        if 'spec_graphs' in batch:
+            batch['spec_graphs'] = [g.to(device, non_blocking=True) for g in batch['spec_graphs']]
+        if 'targets' in batch and isinstance(batch['targets'], torch.Tensor):
+            batch['targets'] = batch['targets'].to(device, non_blocking=True)
+        if 'target_probs' in batch and isinstance(batch['target_probs'], torch.Tensor):
+            batch['target_probs'] = batch['target_probs'].to(device, non_blocking=True)
+        return batch
     
     def on_train_epoch_end(self):
         """Called at the end of training epoch."""

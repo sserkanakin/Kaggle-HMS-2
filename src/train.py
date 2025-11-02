@@ -23,6 +23,8 @@ def train(
     config_path: str = "configs/model.yaml",
     wandb_project: str = "hms-brain-activity",
     wandb_name: str | None = None,
+    wandb_group: str | None = None,
+    wandb_tags: list[str] | None = None,
     resume_from_checkpoint: str | None = None,
     *,
     smoke: bool = False,
@@ -32,6 +34,8 @@ def train(
     max_epochs_override: int | None = None,
     batch_size_override: int | None = None,
     num_workers_override: int | None = None,
+    prefetch_factor_override: int | None = None,
+    pin_memory_override: bool | None = None,
 ):
     """Train HMS Multi-Modal GNN model.
     
@@ -63,12 +67,22 @@ def train(
         _os.environ.setdefault("WANDB_MODE", "offline")
         print("[Info] WANDB_MODE=offline (no internet required)")
     
-    # Environment & multiprocessing tuning to avoid 'Too many open files' and shared-memory errors
+    # Environment & CUDA performance tuning
     # - Limit intra-op/OpenMP threads per worker
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    # Enable fast math paths on NVIDIA Tensor Core GPUs
+    try:
+        torch.set_float32_matmul_precision('high')  # enables TF32 matmuls
+        if torch.backends.cuda.is_built():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+    except Exception as _e:
+        print(f"[Warning] Could not enable TF32/cudnn benchmark: {_e}")
 
     # Try to raise the soft RLIMIT_NOFILE if permitted (helps with many shared-memory fds)
     try:
@@ -107,7 +121,8 @@ def train(
         evaluator_bins=list(config.data.get('evaluator_bins', [0, 5, 10, 15, 20, 999])),
         min_evaluators=config.data.get('min_evaluators', 0),
         num_workers=dm_num_workers,
-        pin_memory=config.data.pin_memory,
+        prefetch_factor=(prefetch_factor_override if prefetch_factor_override is not None else config.data.get('prefetch_factor', 4)),
+        pin_memory=(pin_memory_override if pin_memory_override is not None else config.data.pin_memory),
         shuffle_seed=config.data.shuffle_seed,
         compute_class_weights=(not smoke),
     )
@@ -125,6 +140,7 @@ def train(
         weight_decay=config.training.weight_decay,
         class_weights=class_weights,
         scheduler_config=config.training.scheduler,
+        loss=str(config.training.get('loss', 'kl')),
     )
     
     # Print model info
@@ -137,16 +153,53 @@ def train(
     print(f"  Total parameters:  {model_info['total_params']:,}")
     print(f"  Trainable params:  {model_info['trainable_params']:,}\n")
     
-    # WandB Logger
+    # WandB Logger with helpful defaults (name/group/tags)
+    # Derive a descriptive default name if not provided
+    try:
+        current_fold = config.data.get('current_fold', 0)
+        mixed_precision = (
+            'bf16' if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else (
+                '16' if (getattr(config, 'hardware', None) and getattr(config.hardware, 'mixed_precision', False)) else '32'
+            )
+        )
+        default_name = f"hms-kl-{mixed_precision}-bs{dm_batch_size}-fold{current_fold}"
+    except Exception:
+        default_name = None
+    run_name = wandb_name or default_name
+
+    # Default tags if none provided
+    default_tags = [
+        f"fold{config.data.get('current_fold', 0)}",
+        f"loss={str(config.training.get('loss','kl'))}",
+        f"mp={'bf16' if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else ('16' if (getattr(config, 'hardware', None) and getattr(config.hardware, 'mixed_precision', False)) else '32')}",
+        f"bs={dm_batch_size}",
+        f"nw={dm_num_workers}",
+        f"pf={prefetch_factor_override if prefetch_factor_override is not None else config.data.get('prefetch_factor', 4)}",
+        f"pin={'on' if (pin_memory_override if pin_memory_override is not None else config.data.pin_memory) else 'off'}",
+    ]
+    tags = wandb_tags or default_tags
+
     wandb_logger = WandbLogger(
         project=wandb_project,
-        name=wandb_name,
+        name=run_name,
         save_dir="logs",
         log_model=True,
+        group=wandb_group,
+        tags=tags,
     )
     
     # Log configuration to WandB
     wandb_logger.experiment.config.update(OmegaConf.to_container(config, resolve=True))
+    # Also log runtime overrides for traceability
+    wandb_logger.experiment.config.update({
+        'runtime': {
+            'batch_size_override': batch_size_override,
+            'num_workers_override': num_workers_override,
+            'prefetch_factor_override': prefetch_factor_override,
+            'pin_memory_override': pin_memory_override,
+            'max_epochs_override': max_epochs_override,
+        }
+    })
     
     # Callbacks
     callbacks = []
@@ -184,7 +237,10 @@ def train(
         devices=1,
         logger=wandb_logger,
         callbacks=callbacks,
-        precision=16 if getattr(config, 'hardware', None) and getattr(config.hardware, 'mixed_precision', False) else 32,
+        precision=(
+            ('bf16-mixed' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else '16-mixed')
+            if getattr(config, 'hardware', None) and getattr(config.hardware, 'mixed_precision', False) else 32
+        ),
         gradient_clip_val=1.0,
         log_every_n_steps=10,
         deterministic=False,
@@ -243,6 +299,18 @@ if __name__ == "__main__":
         help="WandB run name",
     )
     parser.add_argument(
+        "--wandb-group",
+        type=str,
+        default=None,
+        help="WandB run group (to cluster related runs)",
+    )
+    parser.add_argument(
+        "--wandb-tags",
+        type=str,
+        default=None,
+        help="Comma-separated list of W&B tags (e.g. fold0,kl,bf16,bs16)",
+    )
+    parser.add_argument(
         "--resume",
         type=str,
         default=None,
@@ -288,13 +356,26 @@ if __name__ == "__main__":
         default=None,
         help="Override num_workers for DataModule",
     )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=None,
+        help="Override prefetch_factor for DataModule (only used when num_workers>0)",
+    )
+    parser.add_argument(
+        "--disable-pin-memory",
+        action="store_true",
+        help="Disable pin_memory in DataLoaders to reduce host memory pressure",
+    )
     
     args = parser.parse_args()
     
     train(
         config_path=args.config,
         wandb_project=args.wandb_project,
-        wandb_name=args.wandb_name,
+    wandb_name=args.wandb_name,
+    wandb_group=args.wandb_group,
+    wandb_tags=(args.wandb_tags.split(',') if args.wandb_tags else None),
         resume_from_checkpoint=args.resume,
         smoke=args.smoke,
         offline=args.offline,
@@ -303,4 +384,6 @@ if __name__ == "__main__":
         max_epochs_override=args.max_epochs,
         batch_size_override=args.batch_size,
         num_workers_override=args.num_workers,
+        prefetch_factor_override=args.prefetch_factor,
+        pin_memory_override=(False if args.disable_pin_memory else None),
     )
