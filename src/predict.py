@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 import csv
+import time
 import torch
 from torch.nn.functional import softmax
 from omegaconf import OmegaConf
@@ -29,6 +30,7 @@ def predict(
 	output_csv: str = "predictions.csv",
 	batch_size_override: int | None = None,
 	num_workers_override: int | None = None,
+	max_batches: int | None = None,
 ):
 	"""Run inference over the test split and save predictions.
 
@@ -62,13 +64,31 @@ def predict(
 		class_weights=None,
 		scheduler_config=config.training.scheduler,
 	)
-	ckpt = torch.load(checkpoint_path, map_location="cpu")
+	# In torch>=2.6, torch.load defaults to weights_only=True which may fail for Lightning checkpoints
+	ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 	model.load_state_dict(ckpt["state_dict"], strict=False)
 	model.eval()
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	model.to(device)
 
 	loader = dm.test_dataloader()
+
+	# Logging: dataset/loader info
+	try:
+		total_batches = len(loader)
+	except Exception:
+		total_batches = None
+	print("\n" + "="*60)
+	print("Inference Start")
+	print(f"  Device:        {device}")
+	print(f"  Batch size:    {loader.batch_size}")
+	print(f"  Num workers:   {loader.num_workers}")
+	print(f"  Test samples:  {len(dm.test_dataset)}")
+	if total_batches is not None:
+		print(f"  Batches:       {total_batches}")
+	if max_batches is not None:
+		print(f"  Max batches:   {max_batches}")
+	print("="*60 + "\n")
 
 	# Write predictions
 	out_path = Path(output_csv)
@@ -78,21 +98,33 @@ def predict(
 		header = ["patient_id", "label_id"] + [f"p_{i}" for i in range(dm.get_num_classes())]
 		writer.writerow(header)
 
-		for batch in loader:
-			eeg_graphs = batch['eeg_graphs']
-			spec_graphs = batch['spec_graphs']
+		batch_times: list[float] = []
+		for bidx, batch in enumerate(loader, 1):
+			start = time.time()
+			eeg_graphs = batch['eeg_graphs']  # List[Batch]
+			spec_graphs = batch['spec_graphs']  # List[Batch]
 			patient_ids = batch['patient_ids']
 			label_ids = batch['label_ids']
 
-			# Move nested PyG lists to device: lists of lists of Data
-			eeg_graphs = [[g.to(device) for g in graphs] for graphs in eeg_graphs]
-			spec_graphs = [[g.to(device) for g in graphs] for graphs in spec_graphs]
+			# Move PyG Batches to device
+			eeg_graphs = [g.to(device) for g in eeg_graphs]
+			spec_graphs = [g.to(device) for g in spec_graphs]
 
 			logits = model(eeg_graphs, spec_graphs)
 			probs = softmax(logits, dim=-1).cpu().tolist()
 
 			for pid, lid, pr in zip(patient_ids, label_ids, probs):
 				writer.writerow([int(pid), int(lid)] + [float(x) for x in pr])
+
+			# Batch timing/logging
+			elapsed = time.time() - start
+			batch_times.append(elapsed)
+			if (bidx % 5 == 1) or (max_batches is not None) or (total_batches is not None and bidx in {1, total_batches}):
+				avg = sum(batch_times) / len(batch_times)
+				print(f"[Infer] Batch {bidx}{'/' + str(total_batches) if total_batches else ''} | {elapsed:.3f}s (avg {avg:.3f}s)")
+			if max_batches is not None and bidx >= max_batches:
+				print(f"[Infer] Reached max_batches={max_batches}, stopping early for testing.")
+				break
 
 	print(f"Saved predictions to {out_path}")
 
@@ -106,6 +138,7 @@ if __name__ == "__main__":
 	parser.add_argument("--output", type=str, default="predictions.csv", help="Output CSV path")
 	parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
 	parser.add_argument("--num-workers", type=int, default=None, help="Override num_workers")
+	parser.add_argument("--max-batches", type=int, default=None, help="Limit number of batches for quick tests")
 	args = parser.parse_args()
 
 	predict(
@@ -114,5 +147,6 @@ if __name__ == "__main__":
 		output_csv=args.output,
 		batch_size_override=args.batch_size,
 		num_workers_override=args.num_workers,
+		max_batches=args.max_batches,
 	)
 

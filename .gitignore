@@ -12,3 +12,20 @@ __pycache__
 !src/data
 
 kaggle.json
+
+# checkpoints, wandb, and other large files, pyc
+checkpoints/
+wandb/
+*.ckpt
+*.h5
+*.pt
+*.pth
+*.log
+*.csv
+*.tsv
+*.parquet
+*.db
+*.sqlite
+*.pyc
+*.pyo
+

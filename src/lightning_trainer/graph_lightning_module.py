@@ -207,7 +207,6 @@ class HMSLightningModule(LightningModule):
                 factor=self.scheduler_config.get('factor', 0.5),
                 patience=self.scheduler_config.get('patience', 5),
                 min_lr=self.scheduler_config.get('min_lr', 1e-6),
-                verbose=True,
             )
             return {
                 'optimizer': optimizer,
